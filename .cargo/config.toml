@@ -1,0 +1,5 @@
+[env]
+# Enable the sqlite_dbpage virtual table, which is required by the
+# replica-side hash queries (SELECT … FROM sqlite_dbpage('replica') …).
+# This flag is picked up by libsqlite3-sys's bundled build script.
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_DBPAGE_VTAB"
