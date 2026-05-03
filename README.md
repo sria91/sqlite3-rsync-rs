@@ -1,8 +1,8 @@
-# sqlite3-rsync-rs
+# sqlite3_rsync-rs
 
 Bandwidth-efficient SQLite database replication, written in Rust.
 
-`sqlite3-rsync-rs` synchronises a *replica* database so that it becomes an
+`sqlite3_rsync-rs` synchronises a *replica* database so that it becomes an
 exact byte-for-byte copy of an *origin* database, transferring only the pages
 that differ — much like `rsync` does for ordinary files.  It is a Rust port of
 the [`sqlite3_rsync`](https://sqlite.org/rsync.html) utility by
@@ -22,7 +22,7 @@ hashes over ranges of pages.
 ```
 origin machine                      replica machine
 ──────────────────────────────────  ──────────────────────────────────
-sqlite3-rsync-rs origin.db …  ────SSH──►  sqlite3-rsync-rs --replica replica.db
+sqlite3_rsync origin.db …  ────SSH──►  sqlite3_rsync --replica replica.db
   │ sends page hashes                       │ compares hashes
   │◄──── mismatched page numbers ───────────┤
   │ sends only changed pages ──────────────►│
@@ -36,8 +36,8 @@ sqlite3-rsync-rs origin.db …  ────SSH──►  sqlite3-rsync-rs --rep
 ### From source
 
 ```sh
-git clone https://github.com/your-org/sqlite3-rsync-rs
-cd sqlite3-rsync-rs
+git clone https://github.com/your-org/sqlite3_rsync-rs
+cd sqlite3_rsync-rs
 cargo install --path .
 ```
 
@@ -65,26 +65,26 @@ in `user@host:/path/to/db` form.
 
 ```sh
 # Sync a local database to a remote replica
-sqlite3-rsync-rs /data/prod.db deploy@db2.example.com:/data/prod.db
+sqlite3_rsync /data/prod.db deploy@db2.example.com:/data/prod.db
 
 # Sync a remote origin down to a local replica
-sqlite3-rsync-rs ops@db1.example.com:/data/prod.db /backup/prod.db
+sqlite3_rsync ops@db1.example.com:/data/prod.db /backup/prod.db
 
 # Sync two local databases (useful for testing)
-sqlite3-rsync-rs origin.db replica.db --origin
+sqlite3_rsync origin.db replica.db --origin
 
 # Show transferred-page statistics
-sqlite3-rsync-rs origin.db user@host:replica.db -v
+sqlite3_rsync origin.db user@host:replica.db -v
 
 # Use a non-standard SSH port
-sqlite3-rsync-rs origin.db user@host:replica.db --port 2222
+sqlite3_rsync origin.db user@host:replica.db --port 2222
 ```
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
-| `--exe PATH` | Name of the `sqlite3-rsync-rs` binary on the remote side |
+| `--exe PATH` | Name of the `sqlite3_rsync` binary on the remote side |
 | `--help` | Show usage screen |
 | `-p`, `--port PORT` | SSH TCP port (default: 22) |
 | `--protocol N` | Force wire-protocol version (1 or 2) |
@@ -106,7 +106,7 @@ use sqlite3_rsync_rs::{origin_side, SqliteRsync};
 use std::process::{Command, Stdio};
 
 let mut child = Command::new("ssh")
-    .args(["user@host", "sqlite3-rsync-rs", "--replica", "/data/replica.db"])
+    .args(["user@host", "sqlite3_rsync", "--replica", "/data/replica.db"])
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .spawn()?;

@@ -4,7 +4,6 @@
 
 use libsqlite3_sys as ffi;
 use log::{debug, error, info, warn};
-use minimal_logger::MinimalLoggerConfig;
 use sqlite3_rsync::{PROTOCOL_VERSION, SqliteRsync, current_time, origin_side, replica_side};
 use std::process::{Child, Command, Stdio};
 
@@ -241,6 +240,146 @@ fn pclose2(child: &mut Child) -> i32 {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// SSH remote sync (shared logic for remote-origin and remote-replica)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Which side is remote?
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemoteSide {
+    Origin,
+    Replica,
+}
+
+/// Helper that builds the common SSH prefix into `cmd`.
+fn build_ssh_prefix(cmd: &mut String, z_ssh: &str, i_port: i32, host: &str, retry: bool) {
+    append_escaped_arg(cmd, z_ssh, true);
+    if i_port > 0 {
+        cmd.push_str(&format!(" -p {}", i_port));
+    }
+    cmd.push_str(" -e none");
+    append_escaped_arg(cmd, host, false);
+    if retry {
+        add_path_argument(cmd);
+    }
+}
+
+/// Helper that appends common debug/error-file options.
+fn append_file_opts(
+    cmd: &mut String,
+    err_file: &Option<String>,
+    debug_file: &Option<String>,
+    wal_only: bool,
+    b_comm_check: bool,
+    verbose: &mut u8,
+) {
+    if b_comm_check {
+        append_escaped_arg(cmd, "--commcheck", false);
+        if *verbose == 0 {
+            *verbose = 1;
+        }
+    }
+    if let Some(f) = err_file {
+        append_escaped_arg(cmd, "--errorfile", false);
+        append_escaped_arg(cmd, f, true);
+    }
+    if let Some(f) = debug_file {
+        append_escaped_arg(cmd, "--debugfile", false);
+        append_escaped_arg(cmd, f, true);
+    }
+    if wal_only {
+        append_escaped_arg(cmd, "--wal-only", false);
+    }
+}
+
+/// Run a sync session where one side is remote (over SSH) with automatic
+/// retry logic.  Returns the spawned child process.
+fn run_remote_sync(
+    ctx: &mut SqliteRsync,
+    side: RemoteSide,
+    host: &str,
+    remote_path: &str,
+    local_tail: &str,
+    z_ssh: &str,
+    i_port: i32,
+    z_exe: &str,
+    z_remote_err: &Option<String>,
+    z_remote_debug: &Option<String>,
+) -> Child {
+    let side_flag = match side {
+        RemoteSide::Origin => "--origin",
+        RemoteSide::Replica => "--replica",
+    };
+
+    let mut i_retry = 0u32;
+    loop {
+        let mut cmd = String::new();
+        build_ssh_prefix(&mut cmd, z_ssh, i_port, host, i_retry > 0);
+        append_escaped_arg(&mut cmd, z_exe, true);
+        append_escaped_arg(&mut cmd, side_flag, false);
+        append_file_opts(
+            &mut cmd,
+            z_remote_err,
+            z_remote_debug,
+            ctx.b_wal_only,
+            ctx.b_comm_check,
+            &mut ctx.e_verbose,
+        );
+        // Remote origin: remote_path first, then local_tail
+        // Remote replica: local_tail first, then remote_path
+        match side {
+            RemoteSide::Origin => {
+                append_escaped_arg(&mut cmd, remote_path, true);
+                append_escaped_arg(&mut cmd, local_tail, true);
+            }
+            RemoteSide::Replica => {
+                append_escaped_arg(&mut cmd, local_tail, true);
+                append_escaped_arg(&mut cmd, remote_path, true);
+            }
+        }
+        if ctx.e_verbose < 2 && i_retry == 0 {
+            append_escaped_arg(&mut cmd, "2>/dev/null", false);
+        }
+        if ctx.e_verbose >= 2 {
+            println!("{}", cmd);
+        }
+        debug!("spawning remote {}: {}", side_flag.trim_start_matches('-'), cmd);
+
+        match popen2(&cmd) {
+            Err(_) => {
+                if i_retry >= 1 {
+                    eprintln!("Could not start auxiliary process: {}", cmd);
+                    error!("could not start auxiliary process: {}", cmd);
+                    std::process::exit(1);
+                }
+                if ctx.e_verbose >= 2 {
+                    println!("ssh FAILED.  Retry with a PATH= argument...");
+                }
+                debug!("ssh FAILED, will retry with PATH= argument");
+                i_retry += 1;
+                continue;
+            }
+            Ok(mut c) => {
+                ctx.p_in = Some(Box::new(c.stdout.take().unwrap()));
+                ctx.p_out = Some(Box::new(c.stdin.take().unwrap()));
+                // Run the local side of the protocol
+                match side {
+                    RemoteSide::Origin => replica_side(ctx),
+                    RemoteSide::Replica => origin_side(ctx),
+                }
+                if ctx.n_hash_sent == 0 && i_retry == 0 {
+                    ctx.p_in = None;
+                    ctx.p_out = None;
+                    let _ = c.wait();
+                    i_retry += 1;
+                    continue;
+                }
+                return c;
+            }
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // main()
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -421,47 +560,6 @@ fn main() {
 
     let mut child: Option<Child>;
 
-    /// Helper that builds the common SSH prefix into `cmd`.
-    fn build_ssh_prefix(cmd: &mut String, z_ssh: &str, i_port: i32, host: &str, retry: bool) {
-        append_escaped_arg(cmd, z_ssh, true);
-        if i_port > 0 {
-            cmd.push_str(&format!(" -p {}", i_port));
-        }
-        cmd.push_str(" -e none");
-        append_escaped_arg(cmd, host, false);
-        if retry {
-            add_path_argument(cmd);
-        }
-    }
-
-    /// Helper that appends common debug/error-file options.
-    fn append_file_opts(
-        cmd: &mut String,
-        err_file: &Option<String>,
-        debug_file: &Option<String>,
-        wal_only: bool,
-        b_comm_check: bool,
-        verbose: &mut u8,
-    ) {
-        if b_comm_check {
-            append_escaped_arg(cmd, "--commcheck", false);
-            if *verbose == 0 {
-                *verbose = 1;
-            }
-        }
-        if let Some(f) = err_file {
-            append_escaped_arg(cmd, "--errorfile", false);
-            append_escaped_arg(cmd, f, true);
-        }
-        if let Some(f) = debug_file {
-            append_escaped_arg(cmd, "--debugfile", false);
-            append_escaped_arg(cmd, f, true);
-        }
-        if wal_only {
-            append_escaped_arg(cmd, "--wal-only", false);
-        }
-    }
-
     if let Some(sep) = host_separator(&origin) {
         // ── Remote ORIGIN, local REPLICA ──
         let host = origin[..sep].to_owned();
@@ -477,126 +575,38 @@ fn main() {
             std::process::exit(1);
         }
 
-        let mut i_retry = 0u32;
-        loop {
-            let mut cmd = String::new();
-            build_ssh_prefix(&mut cmd, &z_ssh, i_port, &host, i_retry > 0);
-            append_escaped_arg(&mut cmd, &z_exe, true);
-            append_escaped_arg(&mut cmd, "--origin", false);
-            append_file_opts(
-                &mut cmd,
-                &z_remote_err,
-                &z_remote_debug,
-                ctx.b_wal_only,
-                ctx.b_comm_check,
-                &mut ctx.e_verbose,
-            );
-            append_escaped_arg(&mut cmd, &remote_path, true);
-            append_escaped_arg(&mut cmd, file_tail(&replica), true);
-            if ctx.e_verbose < 2 && i_retry == 0 {
-                append_escaped_arg(&mut cmd, "2>/dev/null", false);
-            }
-            if ctx.e_verbose >= 2 {
-                println!("{}", cmd);
-            }
-            debug!("spawning remote-origin: {}", cmd);
-
-            match popen2(&cmd) {
-                Err(_) => {
-                    if i_retry >= 1 {
-                        eprintln!("Could not start auxiliary process: {}", cmd);
-                        error!("could not start auxiliary process: {}", cmd);
-                        std::process::exit(1);
-                    }
-                    if ctx.e_verbose >= 2 {
-                        println!("ssh FAILED.  Retry with a PATH= argument...");
-                    }
-                    debug!("ssh FAILED, will retry with PATH= argument");
-                    i_retry += 1;
-                    continue;
-                }
-                Ok(mut c) => {
-                    ctx.p_in = Some(Box::new(c.stdout.take().unwrap()));
-                    ctx.p_out = Some(Box::new(c.stdin.take().unwrap()));
-                    child = Some(c);
-                }
-            }
-            replica_side(&mut ctx);
-            if ctx.n_hash_sent == 0 && i_retry == 0 {
-                ctx.p_in = None;
-                ctx.p_out = None;
-                if let Some(ref mut c) = child {
-                    let _ = c.wait();
-                }
-                drop(child.take());
-                i_retry += 1;
-                continue;
-            }
-            break;
-        }
+        let c = run_remote_sync(
+            &mut ctx,
+            RemoteSide::Origin,
+            &host,
+            &remote_path,
+            file_tail(&replica),
+            &z_ssh,
+            i_port,
+            &z_exe,
+            &z_remote_err,
+            &z_remote_debug,
+        );
+        child = Some(c);
     } else if let Some(sep) = host_separator(&replica) {
         // ── Local ORIGIN, remote REPLICA ──
         let host = replica[..sep].to_owned();
         let remote_path = replica[sep + 1..].to_owned();
         ctx.z_replica = Some(host.clone());
 
-        let mut i_retry = 0u32;
-        loop {
-            let mut cmd = String::new();
-            build_ssh_prefix(&mut cmd, &z_ssh, i_port, &host, i_retry == 1);
-            append_escaped_arg(&mut cmd, &z_exe, true);
-            append_escaped_arg(&mut cmd, "--replica", false);
-            append_file_opts(
-                &mut cmd,
-                &z_remote_err,
-                &z_remote_debug,
-                ctx.b_wal_only,
-                ctx.b_comm_check,
-                &mut ctx.e_verbose,
-            );
-            append_escaped_arg(&mut cmd, file_tail(&origin), true);
-            append_escaped_arg(&mut cmd, &remote_path, true);
-            if ctx.e_verbose < 2 && i_retry == 0 {
-                append_escaped_arg(&mut cmd, "2>/dev/null", false);
-            }
-            if ctx.e_verbose >= 2 {
-                println!("{}", cmd);
-            }
-            debug!("spawning remote-replica: {}", cmd);
-
-            match popen2(&cmd) {
-                Err(_) => {
-                    if i_retry >= 1 {
-                        eprintln!("Could not start auxiliary process: {}", cmd);
-                        error!("could not start auxiliary process: {}", cmd);
-                        std::process::exit(1);
-                    }
-                    if ctx.e_verbose >= 2 {
-                        println!("ssh FAILED.  Retry with a PATH= argument...");
-                    }
-                    debug!("ssh FAILED, will retry with PATH= argument");
-                    i_retry += 1;
-                    continue;
-                }
-                Ok(mut c) => {
-                    ctx.p_in = Some(Box::new(c.stdout.take().unwrap()));
-                    ctx.p_out = Some(Box::new(c.stdin.take().unwrap()));
-                    child = Some(c);
-                }
-            }
-            origin_side(&mut ctx);
-            if ctx.n_hash_sent == 0 && i_retry == 0 {
-                ctx.p_in = None;
-                ctx.p_out = None;
-                if let Some(ref mut c) = child {
-                    let _ = c.wait();
-                }
-                drop(child.take());
-                i_retry += 1;
-                continue;
-            }
-            break;
-        }
+        let c = run_remote_sync(
+            &mut ctx,
+            RemoteSide::Replica,
+            &host,
+            &remote_path,
+            file_tail(&origin),
+            &z_ssh,
+            i_port,
+            &z_exe,
+            &z_remote_err,
+            &z_remote_debug,
+        );
+        child = Some(c);
     } else {
         // ── Both local: spawn self as --replica subprocess ──
         let exe = std::env::current_exe().unwrap_or_else(|_| args[0].clone().into());
@@ -604,17 +614,14 @@ fn main() {
         let mut cmd = String::new();
         append_escaped_arg(&mut cmd, &exe_str, true);
         append_escaped_arg(&mut cmd, "--replica", false);
-        if ctx.b_comm_check {
-            append_escaped_arg(&mut cmd, "--commcheck", false);
-        }
-        if let Some(ref f) = z_remote_err {
-            append_escaped_arg(&mut cmd, "--errorfile", false);
-            append_escaped_arg(&mut cmd, f, true);
-        }
-        if let Some(ref f) = z_remote_debug {
-            append_escaped_arg(&mut cmd, "--debugfile", false);
-            append_escaped_arg(&mut cmd, f, true);
-        }
+        append_file_opts(
+            &mut cmd,
+            &z_remote_err,
+            &z_remote_debug,
+            ctx.b_wal_only,
+            ctx.b_comm_check,
+            &mut ctx.e_verbose,
+        );
         append_escaped_arg(&mut cmd, &origin, true);
         append_escaped_arg(&mut cmd, &replica, true);
         if ctx.e_verbose >= 2 {

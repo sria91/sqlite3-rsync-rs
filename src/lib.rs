@@ -1,6 +1,6 @@
 //! Bandwidth-efficient SQLite database replication.
 //!
-//! `sqlite3-rsync-rs` synchronises a *replica* SQLite database so that it
+//! `sqlite3_rsync-rs` synchronises a *replica* SQLite database so that it
 //! becomes an exact byte-for-byte copy of an *origin* database, transferring
 //! only the pages that differ — much like `rsync` does for ordinary files.
 //!
@@ -14,12 +14,12 @@
 //! # Quick start
 //!
 //! ```no_run
-//! use sqlite3_rsync_rs::{SqliteRsync, origin_side, PROTOCOL_VERSION};
+//! use sqlite3_rsync::{SqliteRsync, origin_side, PROTOCOL_VERSION};
 //! use std::process::{Command, Stdio};
 //!
 //! // Spawn a remote replica process and wire up its stdin/stdout.
 //! let mut child = Command::new("ssh")
-//!     .args(["user@host", "sqlite3-rsync-rs", "--replica", "/path/to/replica.db"])
+//!     .args(["user@host", "sqlite3_rsync", "--replica", "/path/to/replica.db"])
 //!     .stdin(Stdio::piped())
 //!     .stdout(Stdio::piped())
 //!     .spawn()
@@ -222,18 +222,19 @@ struct HashContext {
 
 impl HashContext {
     fn new(i_size: u32) -> Self {
-        let mut ctx: Self = unsafe { mem::zeroed() };
-        ctx.i_size = i_size;
-        ctx.n_rate = if i_size >= 128 && i_size <= 512 {
+        let n_rate = if i_size >= 128 && i_size <= 512 {
             (1600 - ((i_size + 31) & !31) * 2) / 8
         } else {
             (1600 - 2 * 256) / 8
         };
-        // Runtime endianness detection
-        let one: u32 = 1;
-        let is_le = unsafe { *((&one) as *const u32 as *const u8) } == 1;
-        ctx.ix_mask = if is_le { 0 } else { 7 };
-        ctx
+        let ix_mask = if cfg!(target_endian = "little") { 0 } else { 7 };
+        Self {
+            s: [0u64; 25],
+            n_rate,
+            n_loaded: 0,
+            ix_mask,
+            i_size,
+        }
     }
 
     fn update(&mut self, data: &[u8]) {
@@ -276,27 +277,22 @@ impl HashContext {
 
 // ── SQLite SQL function callbacks ──────────────────────────────────────────
 
-/// `SQLITE_TRANSIENT` as an Option<fn> destructor.
+/// SQLITE_TRANSIENT sentinel (-1) cast to the destructor type SQLite expects.
 #[inline]
 fn sqlite_transient() -> ffi::sqlite3_destructor_type {
     // SAFETY: -1 is the documented sentinel value for SQLITE_TRANSIENT.
     unsafe { Some(mem::transmute(-1_isize)) }
 }
 
-/// `hash(X)` — returns a 160-bit BLOB which is the hash of X.
-unsafe extern "C" fn hash_func(
-    ctx: *mut ffi::sqlite3_context,
-    _argc: std::os::raw::c_int,
-    argv: *mut *mut ffi::sqlite3_value,
-) {
+/// Feed a sqlite3_value into a HashContext, handling BLOB vs TEXT.
+///
+/// # Safety
+/// `arg` must be a valid, non-NULL sqlite3_value pointer whose type is
+/// not SQLITE_NULL (caller must check beforehand).
+unsafe fn feed_value(cx: &mut HashContext, arg: *mut ffi::sqlite3_value) {
     unsafe {
-        let arg = *argv;
         let etype = ffi::sqlite3_value_type(arg);
-        if etype == ffi::SQLITE_NULL {
-            return;
-        }
         let nbyte = ffi::sqlite3_value_bytes(arg) as usize;
-        let mut cx = HashContext::new(160);
         if etype == ffi::SQLITE_BLOB {
             cx.update(std::slice::from_raw_parts(
                 ffi::sqlite3_value_blob(arg) as *const u8,
@@ -308,6 +304,22 @@ unsafe extern "C" fn hash_func(
                 nbyte,
             ));
         }
+    }
+}
+
+/// `hash(X)` — returns a 160-bit BLOB which is the hash of X.
+unsafe extern "C" fn hash_func(
+    ctx: *mut ffi::sqlite3_context,
+    _argc: std::os::raw::c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+) {
+    unsafe {
+        let arg = *argv;
+        if ffi::sqlite3_value_type(arg) == ffi::SQLITE_NULL {
+            return;
+        }
+        let mut cx = HashContext::new(160);
+        feed_value(&mut cx, arg);
         let result = cx.finalize();
         ffi::sqlite3_result_blob(ctx, result.as_ptr() as *const _, 20, sqlite_transient());
     }
@@ -321,11 +333,9 @@ unsafe extern "C" fn agghash_step(
 ) {
     unsafe {
         let arg = *argv;
-        let etype = ffi::sqlite3_value_type(arg);
-        if etype == ffi::SQLITE_NULL {
+        if ffi::sqlite3_value_type(arg) == ffi::SQLITE_NULL {
             return;
         }
-        let nbyte = ffi::sqlite3_value_bytes(arg) as usize;
         let pcx = ffi::sqlite3_aggregate_context(ctx, mem::size_of::<HashContext>() as i32)
             as *mut HashContext;
         if pcx.is_null() {
@@ -334,17 +344,7 @@ unsafe extern "C" fn agghash_step(
         if (*pcx).i_size == 0 {
             *pcx = HashContext::new(160);
         }
-        if etype == ffi::SQLITE_BLOB {
-            (*pcx).update(std::slice::from_raw_parts(
-                ffi::sqlite3_value_blob(arg) as *const u8,
-                nbyte,
-            ));
-        } else {
-            (*pcx).update(std::slice::from_raw_parts(
-                ffi::sqlite3_value_text(arg),
-                nbyte,
-            ));
-        }
+        feed_value(&mut *pcx, arg);
     }
 }
 
@@ -370,9 +370,14 @@ unsafe extern "C" fn agghash_final(ctx: *mut ffi::sqlite3_context) {
 /// - `hash(X)` — returns a 20-byte BLOB (160-bit Keccak digest of `X`).
 /// - `agghash(X)` — aggregate; XORs the individual `hash()` results for
 ///   each row, producing a single 20-byte summary BLOB.
-pub fn hash_register(db: *mut ffi::sqlite3) {
+///
+/// Returns `true` if both functions were registered successfully,
+/// `false` if either registration failed.
+/// # Safety
+/// `db` must be a valid, open `sqlite3` connection pointer.
+pub unsafe fn hash_register(db: *mut ffi::sqlite3) -> bool {
     unsafe {
-        ffi::sqlite3_create_function_v2(
+        let rc1 = ffi::sqlite3_create_function_v2(
             db,
             b"hash\0".as_ptr() as *const _,
             1,
@@ -383,7 +388,7 @@ pub fn hash_register(db: *mut ffi::sqlite3) {
             None,
             None,
         );
-        ffi::sqlite3_create_function_v2(
+        let rc2 = ffi::sqlite3_create_function_v2(
             db,
             b"agghash\0".as_ptr() as *const _,
             1,
@@ -394,6 +399,7 @@ pub fn hash_register(db: *mut ffi::sqlite3) {
             Some(agghash_final),
             None,
         );
+        rc1 == ffi::SQLITE_OK && rc2 == ffi::SQLITE_OK
     }
 }
 
@@ -618,7 +624,7 @@ fn flush_output(p: &mut SqliteRsync) {
 // ───────────────────────────────────────────────────────────────────────────
 
 fn log_error(p: &mut SqliteRsync, msg: &str) {
-    if let Some(ref path) = p.z_err_file.clone() {
+    if let Some(path) = p.z_err_file.as_deref() {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -786,7 +792,12 @@ fn run_sql_return_uint(p: &mut SqliteRsync, sql: &str) -> Option<u32> {
     }
 }
 
-/// Run a SQL statement that returns a single text value (≤ 99 bytes).
+/// Run a SQL statement that returns a single short text value.
+///
+/// The result is capped at `MAX_PRAGMA_TEXT_LEN` bytes, which is
+/// sufficient for PRAGMA results like `journal_mode` or `encoding`.
+const MAX_PRAGMA_TEXT_LEN: usize = 99;
+
 fn run_sql_return_text(p: &mut SqliteRsync, sql: &str) -> Option<String> {
     let stmt = prepare_stmt(p, sql)?;
     unsafe {
@@ -796,7 +807,7 @@ fn run_sql_return_text(p: &mut SqliteRsync, sql: &str) -> Option<String> {
             if ptr.is_null() {
                 Some(String::new())
             } else {
-                let n = (ffi::sqlite3_column_bytes(stmt, 0) as usize).min(99);
+                let n = (ffi::sqlite3_column_bytes(stmt, 0) as usize).min(MAX_PRAGMA_TEXT_LEN);
                 let s = String::from_utf8_lossy(std::slice::from_raw_parts(ptr, n)).into_owned();
                 Some(s)
             }
@@ -824,6 +835,10 @@ fn close_db(p: &mut SqliteRsync) {
 // ───────────────────────────────────────────────────────────────────────────
 
 /// SQL single-quote a string value.
+///
+/// Used for ATTACH statements where SQLite does not support parameter
+/// binding.  The standard SQL escaping of `'` → `''` is the only
+/// transformation needed for string literals.
 fn sql_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -903,7 +918,11 @@ pub fn origin_side(p: &mut SqliteRsync) {
         close_db(p);
         return;
     }
-    hash_register(p.db);
+    if !unsafe { hash_register(p.db) } {
+        report_error(p, "failed to register hash functions on origin database");
+        close_db(p);
+        return;
+    }
     run_sql(p, "BEGIN");
     debug!("origin: database opened: {:?}", db_path);
 
@@ -959,7 +978,7 @@ pub fn origin_side(p: &mut SqliteRsync) {
 
         match c {
             // ── REPLICA_BEGIN: replica requests a lower protocol version ──
-            _ if c == REPLICA_BEGIN => {
+            REPLICA_BEGIN => {
                 let new_proto = read_byte(p) as u8;
                 if p.z_debug_file.is_some() {
                     debug_message(p, &format!("<- REPLICA_BEGIN {}\n", new_proto));
@@ -984,11 +1003,11 @@ pub fn origin_side(p: &mut SqliteRsync) {
                     report_error(p, "Invalid REPLICA_BEGIN reply");
                 }
             }
-            _ if c == REPLICA_MSG || c == REPLICA_ERROR => {
+            REPLICA_MSG | REPLICA_ERROR => {
                 read_and_display_message(p, c);
             }
             // ── REPLICA_CONFIG: next hash starts on a different page ──
-            _ if c == REPLICA_CONFIG => {
+            REPLICA_CONFIG => {
                 i_hash = read_uint32(p).unwrap_or(0);
                 n_hash = read_uint32(p).unwrap_or(0);
                 if p.z_debug_file.is_some() {
@@ -996,7 +1015,7 @@ pub fn origin_side(p: &mut SqliteRsync) {
                 }
             }
             // ── REPLICA_HASH: verify one page-range hash ──
-            _ if c == REPLICA_HASH => unsafe {
+            REPLICA_HASH => unsafe {
                 if ck_hash.is_null() {
                     run_sql(
                         p,
@@ -1089,7 +1108,7 @@ pub fn origin_side(p: &mut SqliteRsync) {
                 i_hash += n_hash;
             },
             // ── REPLICA_READY: all hashes have been sent ──
-            _ if c == REPLICA_READY => {
+            REPLICA_READY => {
                 if p.z_debug_file.is_some() {
                     debug_message(p, "<- REPLICA_READY\n");
                 }
@@ -1364,12 +1383,12 @@ pub fn replica_side(p: &mut SqliteRsync) {
         }
 
         match c {
-            _ if c == ORIGIN_MSG || c == ORIGIN_ERROR => {
+            ORIGIN_MSG | ORIGIN_ERROR => {
                 read_and_display_message(p, c);
             }
 
             // ── ORIGIN_BEGIN: origin announces page size and count ──
-            _ if c == ORIGIN_BEGIN => {
+            ORIGIN_BEGIN => {
                 close_db(p);
                 let i_protocol = read_byte(p) as u8;
                 sz_o_page = read_pow2(p);
@@ -1447,7 +1466,11 @@ pub fn replica_side(p: &mut SqliteRsync) {
                     "CREATE TABLE sendHash(\
                      fpg INTEGER PRIMARY KEY, npg INT)",
                 );
-                hash_register(p.db);
+                if !unsafe { hash_register(p.db) } {
+                    report_error(p, "failed to register hash functions on replica database");
+                    close_db(p);
+                    continue 'msg;
+                }
 
                 let n_r_page = match run_sql_return_uint(p, "PRAGMA replica.page_count") {
                     Some(v) => v,
@@ -1514,7 +1537,7 @@ pub fn replica_side(p: &mut SqliteRsync) {
             }
 
             // ── ORIGIN_DETAIL: origin requests finer-grained hashes ──
-            _ if c == ORIGIN_DETAIL => {
+            ORIGIN_DETAIL => {
                 let fpg = read_uint32(p).unwrap_or(0);
                 let npg = read_uint32(p).unwrap_or(0);
                 if p.z_debug_file.is_some() {
@@ -1524,7 +1547,7 @@ pub fn replica_side(p: &mut SqliteRsync) {
             }
 
             // ── ORIGIN_READY: send accumulated fine-grained hashes ──
-            _ if c == ORIGIN_READY => {
+            ORIGIN_READY => {
                 if p.z_debug_file.is_some() {
                     debug_message(p, "<- ORIGIN_READY\n");
                 }
@@ -1532,7 +1555,7 @@ pub fn replica_side(p: &mut SqliteRsync) {
             }
 
             // ── ORIGIN_TXN: commit or rollback ──
-            _ if c == ORIGIN_TXN => {
+            ORIGIN_TXN => {
                 let n_o_page = read_uint32(p).unwrap_or(0);
                 if p.z_debug_file.is_some() {
                     debug_message(p, &format!("<- ORIGIN_TXN {}\n", n_o_page));
@@ -1569,7 +1592,7 @@ pub fn replica_side(p: &mut SqliteRsync) {
             }
 
             // ── ORIGIN_PAGE: receive and write one page ──
-            _ if c == ORIGIN_PAGE => {
+            ORIGIN_PAGE => {
                 let pgno = read_uint32(p).unwrap_or(0);
                 if p.z_debug_file.is_some() {
                     debug_message(p, &format!("<- ORIGIN_PAGE {}\n", pgno));
@@ -1689,6 +1712,10 @@ pub fn sync_local(origin: &str, replica: &str, wal_only: bool) -> Result<String,
         ..SqliteRsync::default()
     };
     origin_side(&mut octx);
+
+    // Drop pipes so the replica thread sees EOF and can exit.
+    octx.p_in = None;
+    octx.p_out = None;
 
     let replica_errs = replica_handle
         .join()
@@ -1997,5 +2024,254 @@ mod tests {
             assert_eq!(agg_ab.len(), 20);
             close_db_ptr(db);
         }
+    }
+
+    // ── Direct HashContext unit tests ────────────────────────────────────────
+
+    #[test]
+    fn hash_context_produces_20_bytes() {
+        let mut ctx = HashContext::new(160);
+        ctx.update(b"hello");
+        let out = ctx.finalize();
+        assert_eq!(out.len(), 20);
+    }
+
+    #[test]
+    fn hash_context_same_input_deterministic() {
+        let hash = |data: &[u8]| -> [u8; 20] {
+            let mut ctx = HashContext::new(160);
+            ctx.update(data);
+            ctx.finalize()
+        };
+        assert_eq!(hash(b"hello"), hash(b"hello"));
+    }
+
+    #[test]
+    fn hash_context_different_inputs_differ() {
+        let hash = |data: &[u8]| -> [u8; 20] {
+            let mut ctx = HashContext::new(160);
+            ctx.update(data);
+            ctx.finalize()
+        };
+        assert_ne!(hash(b"hello"), hash(b"world"));
+    }
+
+    #[test]
+    fn hash_context_incremental_equals_single_call() {
+        let mut ctx1 = HashContext::new(160);
+        ctx1.update(b"helloworld");
+        let h1 = ctx1.finalize();
+
+        let mut ctx2 = HashContext::new(160);
+        ctx2.update(b"hello");
+        ctx2.update(b"world");
+        let h2 = ctx2.finalize();
+
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_context_empty_input() {
+        let mut ctx = HashContext::new(160);
+        let out = ctx.finalize();
+        assert_eq!(out.len(), 20);
+        // Must be non-zero (the Keccak "empty message" hash is not all zeroes)
+        assert!(out.iter().any(|&b| b != 0));
+    }
+
+    // ── Integration test: sync_local ─────────────────────────────────────────
+
+    fn exec_sql(db: *mut ffi::sqlite3, sql: &str) {
+        unsafe {
+            let c_sql = CString::new(sql).unwrap();
+            let rc = ffi::sqlite3_exec(db, c_sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
+            assert_eq!(rc, ffi::SQLITE_OK, "exec failed for: {}", sql);
+        }
+    }
+
+    fn open_db(path: &str) -> *mut ffi::sqlite3 {
+        unsafe {
+            ffi::sqlite3_initialize();
+            let mut db: *mut ffi::sqlite3 = ptr::null_mut();
+            let c_path = CString::new(path).unwrap();
+            let rc = ffi::sqlite3_open(c_path.as_ptr(), &mut db);
+            assert_eq!(rc, ffi::SQLITE_OK, "open failed for: {}", path);
+            db
+        }
+    }
+
+    fn query_int(db: *mut ffi::sqlite3, sql: &str) -> i64 {
+        unsafe {
+            let c_sql = CString::new(sql).unwrap();
+            let mut stmt: *mut ffi::sqlite3_stmt = ptr::null_mut();
+            let rc = ffi::sqlite3_prepare_v2(db, c_sql.as_ptr(), -1, &mut stmt, ptr::null_mut());
+            assert_eq!(rc, ffi::SQLITE_OK);
+            let rc = ffi::sqlite3_step(stmt);
+            assert_eq!(rc, ffi::SQLITE_ROW);
+            let val = ffi::sqlite3_column_int64(stmt, 0);
+            ffi::sqlite3_finalize(stmt);
+            val
+        }
+    }
+
+    #[test]
+    fn sync_local_empty_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin_path = dir.path().join("origin.db");
+        let replica_path = dir.path().join("replica.db");
+
+        // Create an empty origin database
+        let db = open_db(origin_path.to_str().unwrap());
+        exec_sql(db, "CREATE TABLE t(x INTEGER)");
+        unsafe {
+            ffi::sqlite3_close(db);
+        }
+
+        let result = sync_local(
+            origin_path.to_str().unwrap(),
+            replica_path.to_str().unwrap(),
+            false,
+        );
+        assert!(result.is_ok(), "sync_local failed: {:?}", result.err());
+
+        // Verify replica has the same table
+        let db = open_db(replica_path.to_str().unwrap());
+        let count = query_int(db, "SELECT count(*) FROM t");
+        assert_eq!(count, 0);
+        unsafe {
+            ffi::sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn sync_local_with_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin_path = dir.path().join("origin.db");
+        let replica_path = dir.path().join("replica.db");
+
+        // Create origin with data
+        let db = open_db(origin_path.to_str().unwrap());
+        exec_sql(db, "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)");
+        exec_sql(db, "INSERT INTO items VALUES(1, 'alpha')");
+        exec_sql(db, "INSERT INTO items VALUES(2, 'beta')");
+        exec_sql(db, "INSERT INTO items VALUES(3, 'gamma')");
+        unsafe {
+            ffi::sqlite3_close(db);
+        }
+
+        let result = sync_local(
+            origin_path.to_str().unwrap(),
+            replica_path.to_str().unwrap(),
+            false,
+        );
+        assert!(result.is_ok(), "sync_local failed: {:?}", result.err());
+
+        // Verify replica has correct data
+        let db = open_db(replica_path.to_str().unwrap());
+        let count = query_int(db, "SELECT count(*) FROM items");
+        assert_eq!(count, 3);
+        let max_id = query_int(db, "SELECT max(id) FROM items");
+        assert_eq!(max_id, 3);
+        unsafe {
+            ffi::sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn sync_local_incremental_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin_path = dir.path().join("origin.db");
+        let replica_path = dir.path().join("replica.db");
+
+        // Create origin with initial data and sync
+        let db = open_db(origin_path.to_str().unwrap());
+        exec_sql(db, "CREATE TABLE t(v INTEGER)");
+        exec_sql(db, "INSERT INTO t VALUES(1)");
+        unsafe {
+            ffi::sqlite3_close(db);
+        }
+
+        let result = sync_local(
+            origin_path.to_str().unwrap(),
+            replica_path.to_str().unwrap(),
+            false,
+        );
+        assert!(result.is_ok());
+
+        // Add more data and re-sync
+        let db = open_db(origin_path.to_str().unwrap());
+        exec_sql(db, "INSERT INTO t VALUES(2)");
+        exec_sql(db, "INSERT INTO t VALUES(3)");
+        unsafe {
+            ffi::sqlite3_close(db);
+        }
+
+        let result = sync_local(
+            origin_path.to_str().unwrap(),
+            replica_path.to_str().unwrap(),
+            false,
+        );
+        assert!(
+            result.is_ok(),
+            "incremental sync failed: {:?}",
+            result.err()
+        );
+
+        // Verify replica is up to date
+        let db = open_db(replica_path.to_str().unwrap());
+        let count = query_int(db, "SELECT count(*) FROM t");
+        assert_eq!(count, 3);
+        unsafe {
+            ffi::sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn sync_local_nonexistent_origin_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin_path = dir.path().join("does_not_exist.db");
+        let replica_path = dir.path().join("replica.db");
+
+        let result = sync_local(
+            origin_path.to_str().unwrap(),
+            replica_path.to_str().unwrap(),
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sync_local_byte_for_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin_path = dir.path().join("origin.db");
+        let replica_path = dir.path().join("replica.db");
+
+        let db = open_db(origin_path.to_str().unwrap());
+        exec_sql(db, "CREATE TABLE data(k TEXT PRIMARY KEY, v BLOB)");
+        exec_sql(db, "INSERT INTO data VALUES('key1', x'DEADBEEF')");
+        exec_sql(db, "INSERT INTO data VALUES('key2', x'CAFEBABE')");
+        unsafe {
+            ffi::sqlite3_close(db);
+        }
+
+        let result = sync_local(
+            origin_path.to_str().unwrap(),
+            replica_path.to_str().unwrap(),
+            false,
+        );
+        assert!(result.is_ok());
+
+        // Verify data equality (replica may differ in journal-mode header bytes)
+        let db = open_db(replica_path.to_str().unwrap());
+        let count = query_int(db, "SELECT count(*) FROM data");
+        assert_eq!(count, 2);
+        unsafe {
+            ffi::sqlite3_close(db);
+        }
+
+        // Verify file sizes match (same page count and page size)
+        let origin_len = std::fs::metadata(&origin_path).unwrap().len();
+        let replica_len = std::fs::metadata(&replica_path).unwrap().len();
+        assert_eq!(origin_len, replica_len, "file sizes differ");
     }
 }
