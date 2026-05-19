@@ -342,7 +342,11 @@ fn run_remote_sync(
         if ctx.e_verbose >= 2 {
             println!("{}", cmd);
         }
-        debug!("spawning remote {}: {}", side_flag.trim_start_matches('-'), cmd);
+        debug!(
+            "spawning remote {}: {}",
+            side_flag.trim_start_matches('-'),
+            cmd
+        );
 
         match popen2(&cmd) {
             Err(_) => {
@@ -400,7 +404,8 @@ fn main() {
         // SAFETY: called at program start, before any threads are spawned.
         unsafe { std::env::set_var("RUST_LOG", default_level) };
     }
-    minimal_logger::init(minimal_logger::config_from_env()).expect("failed to initialise logger");
+    minimal_logger::init(minimal_logger::MinimalLoggerConfig::from_env())
+        .expect("failed to initialise logger");
 
     let mut ctx = SqliteRsync::default();
     let mut is_origin = false;

@@ -8,7 +8,7 @@ edition = "2024"
 # to link against the system libsqlite3 instead.
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 log = "0.4"
-minimal_logger = "0.5"
+minimal_logger = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

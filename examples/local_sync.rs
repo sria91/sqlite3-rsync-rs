@@ -27,7 +27,8 @@ fn main() {
         .map(String::as_str)
         .collect();
 
-    minimal_logger::init(minimal_logger::config_from_env()).expect("failed to initialise logger");
+    minimal_logger::init(minimal_logger::MinimalLoggerConfig::from_env())
+        .expect("failed to initialise logger");
 
     if positional.len() != 2 {
         eprintln!("Usage: local_sync ORIGIN REPLICA [--wal-only]");
